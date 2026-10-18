@@ -1,7 +1,8 @@
 """API d'interprétation - Challenge 1 : décrochage étudiant."""
 import json
 from pathlib import Path
-
+from functools import lru_cache
+from api.explain import ShapExplainer
 import joblib
 import pandas as pd
 from fastapi import Body, FastAPI, HTTPException, Query
@@ -65,6 +66,10 @@ def to_frame(df: pd.DataFrame) -> pd.DataFrame:
     out[INT_COLS] = out[INT_COLS].astype(int)
     return out
 
+@lru_cache(maxsize=1)
+def get_shap_engine():
+    """Initialiser SHAP une seule fois, au premier appel."""
+    return ShapExplainer(MODELS["xgboost"])
 
 @app.get("/health", summary="Vérifier que l'API fonctionne")
 def health():
@@ -125,3 +130,56 @@ def student(index: int):
     return {"index": index,
             "etudiant": {c: float(row[c]) for c in FEATURES},
             "decrochage_reel": int(row[meta["target"]])}
+
+
+@app.post(
+    "/explain/shap",
+    summary="Expliquer une prédiction XGBoost avec SHAP"
+)
+def explain_shap(req: PredictRequest):
+    # Pour cette première version, SHAP explique XGBoost
+    if req.modele != "xgboost":
+        raise HTTPException(
+            status_code=400,
+            detail="Cette explication SHAP est disponible uniquement pour XGBoost."
+        )
+
+    # Vérifier que toutes les variables sont présentes
+    manquantes = [
+        c for c in FEATURES
+        if c not in req.etudiant
+    ]
+
+    if manquantes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Variables manquantes : {manquantes}"
+        )
+
+    # Réutiliser le prétraitement de l'API
+    row = to_frame(pd.DataFrame([req.etudiant]))
+
+    # Calculer l'explication
+    engine = get_shap_engine()
+    result = engine.explain_student(row.iloc[0].to_dict())
+
+    # Calculer la décision au seuil demandé
+    probability = result["probabilite"]
+
+    return {
+        "modele": "xgboost",
+        "probabilite_decrochage": probability,
+        "seuil": req.seuil,
+        "decision": (
+            "A risque"
+            if probability >= req.seuil
+            else "Pas a risque"
+        ),
+        "base_value": result["base_value"],
+        "unite_shap": result["unite_shap"],
+        "contributions": result["contributions"]
+    }
+
+# Module 5 : routes complementaires SHAP/LIME/importances
+from api.xai_extensions import router as xai_router
+app.include_router(xai_router)

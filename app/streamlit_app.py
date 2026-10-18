@@ -8,13 +8,16 @@ Lancer :  streamlit run app/streamlit_app.py
 """
 import os
 import time
-
+import matplotlib.pyplot as plt
+import shap
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from pathlib import Path
+import joblib
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
@@ -666,12 +669,359 @@ def tab_eval():
 # ----------------------------------------------------------------------------
 # Module 5 : Explicabilité (à venir)
 # ----------------------------------------------------------------------------
-def tab_xai():
-    st.subheader("Module 5 : explicabilité")
-    st.info("Ce module sera ajouté ensuite : importance par permutation, SHAP (beeswarm, "
-            "dépendance, waterfall), LIME et phrase de synthèse. Les routes d'explication "
-            "seront ajoutées à l'API.")
 
+@st.cache_data
+def load_global_shap():
+    root = Path(__file__).resolve().parents[1]
+    artifacts = root / "artifacts"
+
+    # Contributions SHAP précalculées
+    with np.load(
+        artifacts / "shap_global.npz",
+        allow_pickle=False
+    ) as data:
+        values = data["values"].copy()
+        feature_names = data["feature_names"].tolist()
+        base_value = float(data["base_value"])
+
+    # Importances globales
+    importance = pd.read_csv(
+        artifacts / "shap_global_importance.csv"
+    )
+
+    # Valeurs originales des étudiants
+    df = pd.read_csv(artifacts / "test_set.csv")
+    X = df[feature_names].copy()
+
+    return values, feature_names, base_value, importance, X
+
+def tab_xai():
+    st.subheader("Module 5 : Explainable AI")
+    st.caption(
+        "Comprendre les facteurs qui influencent "
+        "les prédictions de décrochage étudiant."
+    )
+
+
+    # ===== EXPLICATIONS GLOBALES =====
+    st.markdown("### Explications globales du modèle")
+
+    try:
+        (
+            global_values,
+            feature_names,
+            base_global,
+            global_importance,
+            X_global
+        ) = load_global_shap()
+
+    except (OSError, ValueError, KeyError) as e:
+        st.error(f"Impossible de charger les données SHAP : {e}")
+        return
+
+    # 1. Importance globale
+    st.markdown("#### Importance des variables")
+
+    top_imp = global_importance.head(12).iloc[::-1]
+
+    fig_global = px.bar(
+        top_imp,
+        x="importance_shap",
+        y="variable",
+        orientation="h",
+        title="Variables les plus influentes selon SHAP",
+        labels={
+            "importance_shap": "Importance moyenne |SHAP|",
+            "variable": ""
+        }
+    )
+
+    fig_global.update_layout(height=550)
+
+    st.plotly_chart(fig_global, width="stretch")
+
+    # 2. Beeswarm
+    st.markdown("#### SHAP Beeswarm")
+
+    st.caption(
+        "Chaque point représente un étudiant. "
+        "La position horizontale indique l'effet "
+        "sur la prédiction, exprimé en log-odds."
+    )
+
+    # Une catégorie codée par un nombre n'a pas
+    # nécessairement d'ordre quantitatif.
+    categorical_cols = [
+        "Marital Status",
+        "Application mode",
+        "Course",
+        "Previous qualification",
+        "Nacionality",
+        "Mother's qualification",
+        "Father's qualification",
+        "Mother's occupation",
+        "Father's occupation"
+    ]
+
+    X_color = X_global.copy()
+
+    for col in categorical_cols:
+        if col in X_color.columns:
+            X_color[col] = np.nan
+
+    # Création de l'objet Explanation
+    global_explanation = shap.Explanation(
+        values=global_values,
+        base_values=np.full(
+            len(global_values),
+            base_global
+        ),
+        data=X_color.to_numpy(dtype=float),
+        feature_names=feature_names
+    )
+
+    plt.figure(figsize=(11, 7))
+
+    shap.plots.beeswarm(
+        global_explanation,
+        max_display=15,
+        show=False
+    )
+
+    fig_beeswarm = plt.gcf()
+
+    st.pyplot(fig_beeswarm)
+    plt.close(fig_beeswarm)
+
+    # 3. Graphiques de dépendance
+    st.markdown("#### Dépendance SHAP")
+
+    st.caption(
+        "Observer comment la contribution d'une "
+        "variable évolue selon sa valeur."
+    )
+
+    numeric_features = [
+        c for c in global_importance["variable"]
+        if c not in categorical_cols
+    ]
+
+    selected_feature = st.selectbox(
+        "Variable à analyser",
+        numeric_features,
+        key="xai_dependence_feature"
+    )
+
+    fig_dep, ax = plt.subplots(figsize=(9, 5))
+
+    idx_feature = feature_names.index(selected_feature)
+
+    ax.scatter(
+        X_global[selected_feature],
+        global_values[:, idx_feature],
+        alpha=0.45,
+        s=18
+    )
+
+    ax.axhline(0, linestyle="--", color="gray")
+
+    ax.set_xlabel(selected_feature)
+    ax.set_ylabel("Contribution SHAP (log-odds)")
+    ax.set_title(
+        f"Effet de {selected_feature} sur le risque prédit"
+    )
+
+    st.pyplot(fig_dep)
+    plt.close(fig_dep)
+
+    st.divider()
+    # ===== FIN EXPLICATIONS GLOBALES =====
+
+    from xai_extensions_ui import render_extra_xai
+    render_extra_xai(api_call)
+
+    st.markdown("### Explication individuelle avec SHAP")
+
+    # Choisir un étudiant dans le jeu de test
+    idx = int(st.number_input(
+        "Numéro de l'étudiant",
+        min_value=0,
+        max_value=884,
+        value=0,
+        step=1,
+        key="xai_student_idx"
+    ))
+
+    seuil = st.slider(
+        "Seuil de décision",
+        min_value=0.01,
+        max_value=0.99,
+        value=0.30,
+        step=0.01,
+        key="xai_threshold"
+    )
+
+    if st.button("Expliquer cet étudiant", key="xai_explain_btn"):
+
+        # 1. Récupérer les caractéristiques
+        student, err = api_call(
+            "GET", f"/students/{idx}"
+        )
+
+        if err:
+            st.error(err)
+            return
+
+        # 2. Demander l'explication SHAP à FastAPI
+        payload = {
+            "modele": "xgboost",
+            "seuil": seuil,
+            "etudiant": student["etudiant"]
+        }
+
+        with st.spinner("Calcul des contributions SHAP..."):
+            result, err = api_call(
+                "POST",
+                "/explain/shap",
+                json=payload
+            )
+
+        if err:
+            st.error(err)
+            return
+
+        # 3. Afficher le risque et la décision
+        p = result["probabilite_decrochage"]
+
+        c1, c2 = st.columns(2)
+        c1.metric("Probabilité de décrochage", f"{p:.2%}")
+        c2.metric("Seuil de décision", f"{seuil:.0%}")
+
+        if p >= seuil:
+            st.error("Décision : étudiant à risque")
+        else:
+            st.success("Décision : étudiant sans alerte")
+
+        # 4. Récupérer les contributions SHAP
+        contributions = pd.Series(
+            result["contributions"],
+            dtype=float
+        )
+
+        # Les 10 facteurs ayant le plus d'impact
+        top = contributions.reindex(
+            contributions.abs()
+            .sort_values(ascending=False)
+            .head(10)
+            .index
+        )
+
+        # 5. Construire le graphique
+        plot_data = pd.DataFrame({
+            "Variable": top.index,
+            "Contribution": top.values
+        })
+
+        plot_data = plot_data.sort_values(
+            "Contribution"
+        )
+
+        plot_data["Effet"] = np.where(
+            plot_data["Contribution"] > 0,
+            "Augmente le risque",
+            "Diminue le risque"
+        )
+
+        fig = px.bar(
+            plot_data,
+            x="Contribution",
+            y="Variable",
+            orientation="h",
+            color="Effet",
+            color_discrete_map={
+                "Augmente le risque": "#D9534F",
+                "Diminue le risque": "#2E86AB"
+            },
+            title="Les 10 principales contributions SHAP"
+        )
+
+        fig.update_layout(
+            height=520,
+            xaxis_title="Contribution SHAP (log-odds)",
+            yaxis_title="",
+            legend_title=""
+        )
+
+        st.plotly_chart(fig, width="stretch")
+
+
+        # 7. Graphique SHAP waterfall
+        st.markdown("### Décomposition SHAP (Waterfall)")
+
+        st.caption(
+            "Le waterfall montre comment chaque variable "
+            "déplace la prédiction par rapport à la valeur "
+            "de référence du modèle."
+        )
+
+        # Récupérer les 36 contributions dans leur ordre
+        shap_contributions = result["contributions"]
+
+        names = list(shap_contributions.keys())
+        values = np.array(
+            list(shap_contributions.values()),
+            dtype=float
+        )
+
+        # Construire un objet SHAP Explanation
+        explanation = shap.Explanation(
+            values=values,
+            base_values=float(result["base_value"]),
+            feature_names=names
+        )
+
+        # Générer le véritable waterfall SHAP
+        shap.plots.waterfall(
+            explanation,
+            max_display=12,
+            show=False
+        )
+
+        fig_waterfall = plt.gcf()
+
+        st.pyplot(fig_waterfall)
+        plt.close(fig_waterfall)
+
+        # 6. Explication textuelle simple
+        st.markdown("### Interprétation")
+
+        positives = contributions[
+            contributions > 0
+        ].sort_values(ascending=False)
+
+        negatives = contributions[
+            contributions < 0
+        ].sort_values()
+
+        if not positives.empty:
+            st.write(
+                "**Principal facteur augmentant le risque :** "
+                f"{positives.index[0]} "
+                f"({positives.iloc[0]:+.3f})."
+            )
+
+        if not negatives.empty:
+            st.write(
+                "**Principal facteur diminuant le risque :** "
+                f"{negatives.index[0]} "
+                f"({negatives.iloc[0]:+.3f})."
+            )
+
+        st.caption(
+            "Les contributions SHAP sont exprimées en "
+            "log-odds. Elles décrivent les effets du modèle "
+            "et ne constituent pas des relations causales."
+        )
 
 # ----------------------------------------------------------------------------
 # Module 6 : API FastAPI

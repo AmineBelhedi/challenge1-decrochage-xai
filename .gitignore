@@ -2,3 +2,11 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Sauvegardes temporaires
+*.xai_backup
+
+# Environnement et caches
+.venv/
+__pycache__/
+.pytest_cache/

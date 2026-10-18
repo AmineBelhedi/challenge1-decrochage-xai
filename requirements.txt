@@ -9,3 +9,7 @@ streamlit
 plotly
 requests
 ucimlrepo
+
+shap==0.54.1
+lime
+matplotlib
